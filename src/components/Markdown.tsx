@@ -16,7 +16,7 @@ function inline(text: string): ReactNode[] {
     if (tok.startsWith('**')) out.push(<strong key={i++}>{tok.slice(2, -2)}</strong>);
     else if (tok.startsWith('`'))
       out.push(
-        <code key={i++} className="rounded bg-black/5 px-1 py-0.5 text-[0.9em] dark:bg-white/10">
+        <code key={i++} className="rounded bg-white/10 px-1 py-0.5 text-[0.9em]">
           {tok.slice(1, -1)}
         </code>,
       );

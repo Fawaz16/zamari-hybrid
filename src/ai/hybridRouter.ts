@@ -1,19 +1,22 @@
 /**
  * Zamari hybrid router — decides, per request, whether Gemini Nano (on-device)
- * or Cloud Gemini does the work, and records every step for the UI.
+ * or Cloud Gemini does the work, and records every step (shown only in debug view).
  *
  *  Help Mode
  *   1. Local pattern scrub (emails, phones, cards, IDs, addresses) — always, instant.
  *   2. Classify the request locally (no model call): quick | draft | complex.
- *   3a. quick/draft  → PREFER_ON_DEVICE (fast; SDK falls back to cloud if Nano isn't ready).
+ *   3a. quick/draft   → PREFER_ON_DEVICE (fast; SDK falls back to cloud if Nano isn't ready).
  *   3b. complex/brief → Nano finds names & other free-form PII → ONLY_IN_CLOUD on the stronger model.
+ *   3c. attachments   → pictures/PDFs/voice notes need multimodal Cloud Gemini; documents are scrubbed first.
  *   4. Clarity Mode: Nano rewrites cloud answers; on-device answers get the rules in-prompt.
  *   5. Placeholders are swapped back to real values locally.
  *
  *  Play Mode
- *   ONLY_ON_DEVICE — zero-latency, private, works offline. Never touches the cloud.
+ *   PREFER_ON_DEVICE — Nano when available (zero latency, private, offline-capable);
+ *   falls back to Cloud Gemini on devices without Nano (e.g. phones).
  */
-import { AIError, InferenceMode, InferenceSource, type GenerativeModel } from 'firebase/ai';
+import { AIError, InferenceMode, InferenceSource, type GenerativeModel, type Part } from 'firebase/ai';
+import type { Attachment } from './attachments';
 import { CLOUD_MODEL_COMPLEX, CLOUD_MODEL_FAST, getHybridModel, getNanoStatus } from './firebase';
 import { PrivacyVault, type PiiKind } from './privacy';
 import {
@@ -41,7 +44,7 @@ export interface RouteStep {
 
 export interface ZamariReply {
   text: string;
-  /** Where the main answer was generated — drives the badge. */
+  /** Where the main answer was generated. */
   engine: Engine;
   model: string;
   steps: RouteStep[];
@@ -60,6 +63,7 @@ export class RouteError extends Error {
 }
 
 const NANO_LABEL = 'Gemini Nano';
+type Prompt = string | (string | Part)[];
 
 // ---------------------------------------------------------------------------
 // Low-level execution
@@ -72,13 +76,13 @@ interface RunResult {
 
 /**
  * Runs one prompt. Streams partial text through `onText` when provided.
- * The engine comes from the SDK's `inferenceSource`, so badges reflect what
- * actually happened (including PREFER_ON_DEVICE falling back to the cloud).
+ * The engine comes from the SDK's `inferenceSource`, so routing info reflects
+ * what actually happened (including PREFER_ON_DEVICE falling back to the cloud).
  */
 async function run(
   model: GenerativeModel,
   mode: InferenceMode,
-  prompt: string,
+  prompt: Prompt,
   onText?: (text: string) => void,
 ): Promise<RunResult> {
   const fallbackEngine: Engine = mode === InferenceMode.ONLY_ON_DEVICE ? 'nano' : 'cloud';
@@ -122,6 +126,36 @@ export function classifyHelpRequest(input: string): HelpIntent {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+const KIND_LABEL: Record<Attachment['kind'], string> = {
+  image: 'picture',
+  pdf: 'PDF',
+  document: 'document',
+  audio: 'voice note',
+};
+
+/** Appends an attachment manifest + (masked) document text to the user's message. */
+function withAttachmentText(input: string, attachments: Attachment[], vault: PrivacyVault): string {
+  if (!attachments.length) return input;
+  const manifest = attachments.map((a) => `${KIND_LABEL[a.kind]} "${a.name}"`).join(', ');
+  const docs = attachments
+    .filter((a) => a.kind === 'document' && a.text)
+    .map((a) => `\n--- Document "${a.name}" ---\n${vault.maskPatterns(a.text!)}\n--- End of document ---`)
+    .join('\n');
+  return `${input || '(no message — respond to the attachments)'}\n[Attached: ${manifest}]${docs}`;
+}
+
+function inlineParts(attachments: Attachment[]): Part[] {
+  return attachments
+    .filter((a) => a.data)
+    .map((a) => ({ type: 'inlineData' as const, inlineData: { mimeType: a.mimeType, data: a.data! } }));
+}
+
+const needsCloud = (attachments: Attachment[]) => attachments.some((a) => a.kind !== 'document');
+
+// ---------------------------------------------------------------------------
 // Privacy scrubbing
 // ---------------------------------------------------------------------------
 
@@ -152,6 +186,7 @@ export interface HelpRequest {
   input: string;
   history: ChatTurn[];
   clarity: boolean;
+  attachments?: Attachment[];
   /** Force the Zafari Lab project-brief escalation. */
   brief?: boolean;
   online: boolean;
@@ -161,7 +196,10 @@ export interface HelpRequest {
 export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
   const steps: RouteStep[] = [];
   const vault = new PrivacyVault();
-  const intent: HelpIntent = req.brief ? 'complex' : classifyHelpRequest(req.input);
+  const attachments = req.attachments ?? [];
+  const hasAttachments = attachments.length > 0;
+  const intent: HelpIntent =
+    req.brief || hasAttachments ? 'complex' : classifyHelpRequest(req.input);
   const hasNano = await nanoReady();
 
   // 1. Pattern scrub — everything below works on masked text; the UI only ever sees revealed text.
@@ -174,14 +212,18 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
 
   // 2. Offline: everything must stay on-device.
   if (!req.online) {
+    if (needsCloud(attachments)) {
+      throw new RouteError('Pictures and voice notes need an internet connection. Try again when you’re back online.', 'offline');
+    }
     if (!hasNano) {
-      throw new RouteError("You're offline and Gemini Nano isn't set up on this device yet.", 'offline');
+      throw new RouteError("You're offline right now. Reconnect and I'll be right here! 📡", 'offline');
     }
     steps.push({ label: 'Offline — kept on-device', engine: 'local' });
     const masked = vault.size > 0;
+    const fullInput = withAttachmentText(input, attachments, vault);
     const prompt =
       intent === 'complex'
-        ? helpComplexPrompt({ input, history, clarity: req.clarity, brief: !!req.brief })
+        ? helpComplexPrompt({ input: fullInput, history, clarity: req.clarity, brief: !!req.brief, attachments: hasAttachments })
         : intent === 'draft'
           ? helpDraftPrompt({ input, history, clarity: req.clarity, masked })
           : helpQuickPrompt({ input, history, clarity: req.clarity, masked });
@@ -213,7 +255,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
     };
   }
 
-  // 3b. Complex → deep scrub on Nano, then escalate to Cloud Gemini.
+  // 3b/3c. Complex or attachments → deep scrub on Nano, then escalate to Cloud Gemini.
   if (hasNano) {
     try {
       const context = `${transcript(history, 4)}\nUser: ${input}`.slice(-3000);
@@ -232,10 +274,21 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
 
   // When Nano can do the Clarity rewrite, ask the cloud for a normal answer; otherwise fold the rules into the cloud prompt.
   const nanoClarity = req.clarity && hasNano;
-  const cloudPrompt = helpComplexPrompt({ input, history, clarity: req.clarity && !nanoClarity, brief: !!req.brief });
+  const cloudText = helpComplexPrompt({
+    input: withAttachmentText(input, attachments, vault),
+    history,
+    clarity: req.clarity && !nanoClarity,
+    brief: !!req.brief,
+    attachments: hasAttachments,
+  });
+  const parts = inlineParts(attachments);
+  const cloudPrompt: Prompt = parts.length ? [cloudText, ...parts] : cloudText;
   const cloudModel = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: CLOUD_MODEL_COMPLEX });
   const answer = await run(cloudModel, InferenceMode.ONLY_IN_CLOUD, cloudPrompt, nanoClarity ? undefined : stream);
-  steps.push({ label: req.brief ? 'Zafari Lab project brief' : 'Escalated answer', engine: answer.engine });
+  steps.push({
+    label: req.brief ? 'Zafari Lab project brief' : hasAttachments ? 'Answer with attachments' : 'Escalated answer',
+    engine: answer.engine,
+  });
 
   let finalText = answer.text;
   if (nanoClarity) {
@@ -260,7 +313,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
 }
 
 // ---------------------------------------------------------------------------
-// Play Mode — 100% on-device
+// Play Mode — on-device first
 // ---------------------------------------------------------------------------
 
 export interface PlayRequest {
@@ -268,41 +321,59 @@ export interface PlayRequest {
   input: string;
   history: ChatTurn[];
   clarity: boolean;
-  /** 20 Questions: chosen locally so it stays consistent across stateless Nano sessions. */
+  online: boolean;
+  attachments?: Attachment[];
+  /** 20 Questions: chosen locally so it stays consistent across stateless sessions. */
   secret?: string;
   questionNumber?: number;
   onText?: (text: string) => void;
 }
 
 export async function routePlay(req: PlayRequest): Promise<ZamariReply> {
-  if (!(await nanoReady())) {
-    throw new RouteError(
-      'Play Mode runs only on-device. Enable Gemini Nano (Chrome desktop) to play — nothing is sent to the cloud.',
-      'nano-required',
-    );
+  const attachments = req.attachments ?? [];
+  const vault = new PrivacyVault();
+  const input = withAttachmentText(req.input, attachments, vault);
+  const text = playPrompt({ ...req, input, attachments: attachments.length > 0 });
+  const parts = inlineParts(attachments);
+
+  let mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE;
+  if (parts.length) {
+    if (!req.online) throw new RouteError('Pictures and voice notes need an internet connection.', 'offline');
+    mode = InferenceMode.ONLY_IN_CLOUD;
+  } else if (!req.online) {
+    if (!(await nanoReady())) throw new RouteError("You're offline right now. Reconnect and let's play! 🎮", 'offline');
+    mode = InferenceMode.ONLY_ON_DEVICE;
   }
-  const model = getHybridModel(InferenceMode.ONLY_ON_DEVICE, { temperature: 0.9 });
-  const res = await run(model, InferenceMode.ONLY_ON_DEVICE, playPrompt(req), req.onText);
-  return { text: res.text, engine: 'nano', model: NANO_LABEL, steps: [{ label: 'Play', engine: 'nano' }] };
+
+  const model = getHybridModel(mode, { cloudModel: CLOUD_MODEL_FAST, temperature: 0.9 });
+  const res = await run(model, mode, parts.length ? [text, ...parts] : text, req.onText);
+  return {
+    text: res.text,
+    engine: res.engine,
+    model: modelLabel(res.engine, CLOUD_MODEL_FAST),
+    steps: [{ label: 'Play', engine: res.engine }],
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Errors
+// Errors (friendly, and never mention the underlying provider)
 // ---------------------------------------------------------------------------
 
 export function describeError(e: unknown): string {
   if (e instanceof RouteError) return e.message;
   if (e instanceof AIError) {
+    console.error('[Zamari] AI error', e.code, e.message);
     const msg = e.message.toLowerCase();
     if (msg.includes('app check') || msg.includes('appcheck')) {
-      return 'App Check rejected the request. In dev, register the debug token printed in the console.';
+      return 'I couldn’t verify this app just now. Please refresh and try again.';
     }
-    if (msg.includes('quota') || msg.includes('429')) return 'Cloud Gemini is busy right now. Please try again shortly.';
-    if (msg.includes('api_not_enabled') || msg.includes('not enabled')) {
-      return 'Firebase AI Logic is not enabled for this project yet (Firebase console → AI Logic).';
-    }
-    return `AI error: ${e.message}`;
+    if (msg.includes('quota') || msg.includes('429')) return 'I’m a little overloaded right now 😅 Give me a moment and try again.';
+    if (msg.includes('safety') || msg.includes('blocked')) return 'I can’t help with that one — want to try something else?';
+    return 'Oops, something glitched on my side. Mind trying that again?';
   }
-  if (e instanceof Error) return e.message;
+  if (e instanceof Error) {
+    console.error(e);
+    return e.message.includes('Firebase') ? 'Zamari isn’t set up correctly yet.' : 'Oops, something went wrong. Please try again.';
+  }
   return 'Something went wrong.';
 }
