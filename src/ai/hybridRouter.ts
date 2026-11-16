@@ -426,7 +426,7 @@ export function describeError(e: unknown): string {
   if (e instanceof AIError) {
     console.error('[Zamari] AI error', e.code, e.message);
     const msg = e.message.toLowerCase();
-    if (msg.includes('app check') || msg.includes('appcheck')) {
+    if (msg.includes('app check') || msg.includes('appcheck') || msg.includes('401')) {
       return 'I couldn’t verify this app just now. Please refresh and try again.';
     }
     if (msg.includes('quota') || msg.includes('429')) return 'I’m a little overloaded right now 😅 Give me a moment and try again.';

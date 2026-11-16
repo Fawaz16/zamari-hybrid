@@ -111,12 +111,21 @@ export async function startVoiceRecording(): Promise<VoiceRecorder> {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new AttachmentError('Voice recording isn’t supported in this browser.');
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-  });
+  // Create + resume the AudioContext synchronously inside the tap handler:
+  // iOS Safari leaves it suspended (recording silence) if this happens after an await.
   const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const ctx = new Ctx();
-  await ctx.resume();
+  const resumed = ctx.resume();
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    });
+    await resumed;
+  } catch (e) {
+    void ctx.close();
+    throw e;
+  }
   const source = ctx.createMediaStreamSource(stream);
   // ScriptProcessor is deprecated but universally supported (incl. iOS Safari) and fine for short notes.
   const processor = ctx.createScriptProcessor(4096, 1, 1);
