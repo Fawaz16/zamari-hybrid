@@ -13,7 +13,9 @@ import {
   ClarityIcon,
   CloseIcon,
   CopyIcon,
+  DownloadIcon,
   FileIcon,
+  ImageIcon,
   MicIcon,
   PenIcon,
   PlusIcon,
@@ -26,7 +28,8 @@ import {
 import { Markdown } from './components/Markdown';
 import { Orb } from './components/Orb';
 import { RouteDetails } from './components/RouteBadge';
-import { useNano, useOnline, usePersistentState } from './hooks';
+import { useImagesLeft, useNano, useOnline, usePersistentState } from './hooks';
+import { imageLimit } from './ai/imageQuota';
 
 type AppMode = 'help' | 'play';
 
@@ -75,6 +78,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const online = useOnline();
   const nano = useNano();
+  const imagesLeft = useImagesLeft();
   const composer = useRef<ComposerHandle | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const messages = threads[mode];
@@ -263,6 +267,11 @@ export default function App() {
                   composer.current?.focus();
                 }}
                 onSnap={() => composer.current?.openFilePicker('image/*,application/pdf,.pdf,.docx,.txt,.md,.csv')}
+                onCreateImage={() => {
+                  setDraft('Create a picture of ');
+                  composer.current?.focus();
+                }}
+                imagesLeft={imagesLeft}
                 disabled={busy}
               />
             ) : (
@@ -333,6 +342,8 @@ function HelpHome(props: {
   onAsk: () => void;
   onDraft: () => void;
   onSnap: () => void;
+  onCreateImage: () => void;
+  imagesLeft: number;
   disabled: boolean;
 }) {
   return (
@@ -361,6 +372,25 @@ function HelpHome(props: {
         </div>
         <HomeCard icon={<PenIcon />} title="Draft a message" onClick={props.onDraft} disabled={props.disabled} />
         <HomeCard icon={<CameraIcon />} title="Snap or upload & ask" onClick={props.onSnap} disabled={props.disabled} />
+        {imageLimit > 0 && (
+          <button
+            type="button"
+            disabled={props.disabled}
+            onClick={props.onCreateImage}
+            className="glass col-span-2 flex items-center gap-3 rounded-3xl p-4 text-left hover:bg-surface-strong focus-visible:outline-2 focus-visible:outline-accent-violet disabled:opacity-50"
+          >
+            <span className="bg-gradient-brand flex h-10 w-10 flex-none items-center justify-center rounded-full text-white">
+              <ImageIcon />
+            </span>
+            <span className="flex-1">
+              <span className="block text-sm font-semibold">Create a picture</span>
+              <span className="block text-xs text-muted">Describe anything and I’ll draw it</span>
+            </span>
+            <span className="rounded-full bg-surface-strong px-2.5 py-1 text-[11px] font-semibold text-muted">
+              {props.imagesLeft}/{imageLimit} left today
+            </span>
+          </button>
+        )}
       </div>
 
       <div className="mt-8 flex items-center justify-between">
@@ -487,6 +517,9 @@ function MessageItem({ msg }: { msg: Message }) {
       <Orb size={28} active={msg.pending} className="mt-1" />
       <div className="min-w-0 flex-1">
         <span className="sr-only">Zamari said: </span>
+        {msg.reply?.images?.map((img, i) => (
+          <GeneratedImage key={i} mimeType={img.mimeType} data={img.data} />
+        ))}
         {msg.text ? (
           <div className="prose-zamari text-[15px] leading-relaxed text-fg/95">
             <Markdown text={msg.text} />
@@ -505,6 +538,27 @@ function MessageItem({ msg }: { msg: Message }) {
         {DEBUG && msg.reply && <RouteDetails reply={msg.reply} />}
       </div>
     </article>
+  );
+}
+
+function GeneratedImage({ mimeType, data }: { mimeType: string; data: string }) {
+  const src = `data:${mimeType};base64,${data}`;
+  const ext = mimeType.split('/')[1] ?? 'png';
+  return (
+    <figure className="mb-3">
+      <img
+        src={src}
+        alt="Picture created by Zamari"
+        className="ring-gradient w-full max-w-md rounded-3xl border border-line object-cover shadow-2xl shadow-purple-950/40"
+      />
+      <a
+        href={src}
+        download={`zamari-${Date.now()}.${ext}`}
+        className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-surface-strong px-3 py-1.5 text-xs font-semibold hover:bg-white/15 focus-visible:outline-2 focus-visible:outline-accent-violet"
+      >
+        <DownloadIcon size={14} /> Save picture
+      </a>
+    </figure>
   );
 }
 

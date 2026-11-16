@@ -16,6 +16,7 @@ import {
   getGenerativeModel,
   GoogleAIBackend,
   InferenceMode,
+  ResponseModality,
   type AI,
   type GenerativeModel,
   type LanguageModelExpected,
@@ -40,6 +41,9 @@ const firebaseConfig: FirebaseOptions = {
 
 export const CLOUD_MODEL_FAST: string = env.VITE_CLOUD_MODEL_FAST || 'gemini-3.5-flash-lite';
 export const CLOUD_MODEL_COMPLEX: string = env.VITE_CLOUD_MODEL_COMPLEX || 'gemini-3.6-flash';
+/** Image generation is cloud-only and needs the Firebase Blaze plan (no free-tier quota). */
+export const CLOUD_MODEL_IMAGE: string = env.VITE_CLOUD_MODEL_IMAGE || 'gemini-3.1-flash-image-preview';
+export const IMAGE_DAILY_LIMIT: number = Math.max(0, Number(env.VITE_IMAGE_DAILY_LIMIT ?? 5) || 0);
 
 /** True when the minimum Firebase config is present. The UI shows a setup banner otherwise. */
 export const isFirebaseConfigured = Boolean(
@@ -105,6 +109,8 @@ export interface HybridModelOptions {
   temperature?: number;
   /** JSON Schema that constrains Gemini Nano's output (Prompt API `responseConstraint`). */
   onDeviceJsonSchema?: { name: string; schema: object };
+  /** Ask the cloud model to return images as well as text. */
+  imageOutput?: boolean;
 }
 
 /**
@@ -115,19 +121,22 @@ export interface HybridModelOptions {
  */
 export function getHybridModel(
   mode: InferenceMode,
-  { cloudModel = CLOUD_MODEL_FAST, temperature, onDeviceJsonSchema }: HybridModelOptions = {},
+  { cloudModel = CLOUD_MODEL_FAST, temperature, onDeviceJsonSchema, imageOutput }: HybridModelOptions = {},
 ): GenerativeModel {
   if (!firebase) {
     throw new Error('Firebase is not configured. Copy .env.example to .env.local and fill it in.');
   }
-  const key = `${mode}|${cloudModel}|${temperature ?? ''}|${onDeviceJsonSchema?.name ?? ''}`;
+  const key = `${mode}|${cloudModel}|${temperature ?? ''}|${onDeviceJsonSchema?.name ?? ''}|${imageOutput ? 'img' : ''}`;
   let model = modelCache.get(key);
   if (!model) {
     model = getGenerativeModel(firebase.ai, {
       mode,
       inCloudParams: {
         model: cloudModel,
-        ...(temperature !== undefined && { generationConfig: { temperature } }),
+        generationConfig: {
+          ...(temperature !== undefined && { temperature }),
+          ...(imageOutput && { responseModalities: [ResponseModality.TEXT, ResponseModality.IMAGE] }),
+        },
       },
       onDeviceParams: {
         createOptions: { expectedInputs: EN_TEXT, expectedOutputs: EN_TEXT },

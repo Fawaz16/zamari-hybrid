@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getNanoStatus, prepareNano, type NanoStatus } from './ai/firebase';
+import { imagesLeftToday } from './ai/imageQuota';
 
 export function useOnline(): boolean {
   const [online, setOnline] = useState(() => navigator.onLine);
@@ -49,6 +50,21 @@ export function useNano() {
   }, [refresh]);
 
   return { status, progress, error, enable };
+}
+
+/** Live count of today's remaining picture creations. */
+export function useImagesLeft(): number {
+  const [left, setLeft] = useState(imagesLeftToday);
+  useEffect(() => {
+    const update = () => setLeft(imagesLeftToday());
+    window.addEventListener('zamari:quota', update);
+    window.addEventListener('focus', update);
+    return () => {
+      window.removeEventListener('zamari:quota', update);
+      window.removeEventListener('focus', update);
+    };
+  }, []);
+  return left;
 }
 
 export function usePersistentState<T>(key: string, initial: T) {

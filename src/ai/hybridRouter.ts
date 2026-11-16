@@ -17,7 +17,8 @@
  */
 import { AIError, InferenceMode, InferenceSource, type GenerativeModel, type Part } from 'firebase/ai';
 import type { Attachment } from './attachments';
-import { CLOUD_MODEL_COMPLEX, CLOUD_MODEL_FAST, getHybridModel, getNanoStatus } from './firebase';
+import { CLOUD_MODEL_COMPLEX, CLOUD_MODEL_FAST, CLOUD_MODEL_IMAGE, getHybridModel, getNanoStatus } from './firebase';
+import { imageLimit, imagesLeftToday, recordImageCreated } from './imageQuota';
 import { PrivacyVault, type PiiKind } from './privacy';
 import {
   clarityRewritePrompt,
@@ -50,6 +51,8 @@ export interface ZamariReply {
   steps: RouteStep[];
   /** Present when anything was masked before leaving the device. */
   privacy?: { masked: Partial<Record<PiiKind, number>>; total: number };
+  /** Generated images (base64). */
+  images?: { mimeType: string; data: string }[];
 }
 
 export class RouteError extends Error {
@@ -118,6 +121,14 @@ const COMPLEX_HINTS =
   /\b(project brief|zafari|business plan|proposal|strategy|roadmap|architecture|research|in[- ]depth|detailed|analy[sz]e|analysis|compare|pros and cons|step[- ]by[- ]step plan|itinerary|curriculum|budget|build (?:me )?(?:an?|the|my) (?:app|website|platform|product|startup))\b/i;
 const DRAFT_HINTS =
   /\b(draft|write|reply|respond|rephrase|reword|email|message|text (?:to|for)|letter|note to|cover letter|caption|apologi[sz]e)\b/i;
+
+const IMAGE_HINTS =
+  /^\s*(?:please\s+)?(?:draw|paint|sketch|illustrate|imagine)\b|\b(?:create|generate|make|draw|design|render|paint|give me|show me)\b.{0,40}\b(?:image|picture|pic|photo|drawing|illustration|logo|poster|artwork|art|painting|wallpaper|sticker|icon|avatar|cartoon|meme)\b/i;
+
+/** True when the user is asking Zamari to create a picture. */
+export function isImageRequest(input: string): boolean {
+  return IMAGE_HINTS.test(input);
+}
 
 export function classifyHelpRequest(input: string): HelpIntent {
   if (input.length > 700 || /```/.test(input) || COMPLEX_HINTS.test(input)) return 'complex';
@@ -194,6 +205,7 @@ export interface HelpRequest {
 }
 
 export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
+  if (!req.brief && isImageRequest(req.input)) return routeImage(req);
   const steps: RouteStep[] = [];
   const vault = new PrivacyVault();
   const attachments = req.attachments ?? [];
@@ -313,6 +325,56 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
 }
 
 // ---------------------------------------------------------------------------
+// Image creation — cloud only, with a daily allowance
+// ---------------------------------------------------------------------------
+
+export async function routeImage(req: HelpRequest): Promise<ZamariReply> {
+  if (!req.online) throw new RouteError('Creating pictures needs an internet connection 📡', 'offline');
+  if (imagesLeftToday() <= 0) {
+    throw new RouteError(
+      `You’ve used all ${imageLimit} picture creations for today ✨ Your allowance resets tomorrow — but I’m still happy to chat!`,
+      'ai',
+    );
+  }
+
+  const vault = new PrivacyVault();
+  const prompt = vault.maskPatterns(req.input);
+  const refs = inlineParts((req.attachments ?? []).filter((a) => a.kind === 'image'));
+  const instruction =
+    'You are Zamari, a playful creative companion. Create one image for this request. ' +
+    'Keep it tasteful and family-friendly. Do not add any watermark or signature. ' +
+    (refs.length ? 'Use the attached picture(s) as the starting point or reference. ' : '') +
+    'Then add one short, fun sentence about what you made.\n\nRequest: ' +
+    prompt;
+
+  const model = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: CLOUD_MODEL_IMAGE, imageOutput: true });
+  const { response } = await model.generateContent(refs.length ? [instruction, ...refs] : instruction);
+  const images = (response.inlineDataParts() ?? [])
+    .filter((p) => p.inlineData.mimeType.startsWith('image/'))
+    .map((p) => ({ mimeType: p.inlineData.mimeType, data: p.inlineData.data }));
+
+  if (!images.length) {
+    throw new RouteError('I couldn’t make that picture — try describing it a little differently? 🎨', 'ai');
+  }
+  recordImageCreated();
+  let caption = '';
+  try {
+    caption = response.text();
+  } catch {
+    /* image-only response */
+  }
+  const left = imagesLeftToday();
+  return {
+    text: `${vault.reveal(caption.trim()) || 'Here you go! 🎨'}\n\n*${left} picture${left === 1 ? '' : 's'} left today*`,
+    engine: 'cloud',
+    model: CLOUD_MODEL_IMAGE,
+    steps: [{ label: 'Image creation', engine: 'cloud', detail: `${left}/${imageLimit} left today` }],
+    images,
+    privacy: privacyInfo(vault),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Play Mode — on-device first
 // ---------------------------------------------------------------------------
 
@@ -368,6 +430,7 @@ export function describeError(e: unknown): string {
       return 'I couldn’t verify this app just now. Please refresh and try again.';
     }
     if (msg.includes('quota') || msg.includes('429')) return 'I’m a little overloaded right now 😅 Give me a moment and try again.';
+    if (msg.includes('not found') || msg.includes('404')) return 'That feature isn’t available right now. Please try something else!';
     if (msg.includes('safety') || msg.includes('blocked')) return 'I can’t help with that one — want to try something else?';
     return 'Oops, something glitched on my side. Mind trying that again?';
   }
