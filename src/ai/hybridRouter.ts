@@ -26,7 +26,15 @@ import {
   type Part,
 } from 'firebase/ai';
 import type { Attachment } from './attachments';
-import { CLOUD_MODEL_COMPLEX, CLOUD_MODEL_FAST, CLOUD_MODEL_IMAGE, getHybridModel, getNanoStatus } from './firebase';
+import {
+  CLOUD_MODEL_BACKUP,
+  CLOUD_MODEL_COMPLEX,
+  CLOUD_MODEL_FAST,
+  CLOUD_MODEL_IMAGE,
+  getHybridModel,
+  getNanoStatus,
+  type HybridModelOptions,
+} from './firebase';
 import { imageLimit, imagesLeftToday, recordImageCreated } from './imageQuota';
 import { PrivacyVault, type PiiKind } from './privacy';
 import {
@@ -141,6 +149,60 @@ async function run(
 }
 
 const modelLabel = (engine: Engine, cloudModel: string) => (engine === 'nano' ? NANO_LABEL : cloudModel);
+
+// ---------------------------------------------------------------------------
+// Resilience — busy/rate-limited cloud models are retried, then swapped for a backup
+// ---------------------------------------------------------------------------
+
+/** 429 = rate limit / quota, 5xx = Google-side overload or outage. Worth retrying elsewhere. */
+function isRetryable(e: unknown): boolean {
+  if (!(e instanceof AIError)) return false;
+  const status = e.customErrorData?.status;
+  if (status === 429 || (status !== undefined && status >= 500)) return true;
+  return /\b(429|500|502|503|504)\b|overloaded|unavailable|resource.?exhausted|quota/i.test(e.message);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Primary model first, then the other Gemini tier (they have separate rate limits), then an optional backup. */
+function cloudChain(primary: string): string[] {
+  const other = primary === CLOUD_MODEL_COMPLEX ? CLOUD_MODEL_FAST : CLOUD_MODEL_COMPLEX;
+  return [...new Set([primary, other, CLOUD_MODEL_BACKUP].filter(Boolean) as string[])];
+}
+
+/**
+ * Runs a prompt with retry + model fallback. Each model gets one quick retry with
+ * jittered backoff before moving to the next. Once any text has streamed to the
+ * user we stop retrying, so an answer never restarts halfway through.
+ */
+async function runResilient(
+  mode: InferenceMode,
+  primary: string,
+  options: Omit<HybridModelOptions, 'cloudModel'>,
+  prompt: Prompt,
+  onText?: (text: string) => void,
+): Promise<RunResult & { model: string }> {
+  let streamed = false;
+  const track = onText ? (t: string) => ((streamed = true), onText(t)) : undefined;
+  let lastError: unknown;
+  for (const cloudModel of cloudChain(primary)) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        // The retry drops web search: it isn't available on the free tier and has its own daily cap,
+        // so a plain answer beats an error.
+        const model = getHybridModel(mode, { ...options, cloudModel, webSearch: attempt === 0 && options.webSearch });
+        const res = await run(model, mode, prompt, track);
+        return { ...res, model: cloudModel };
+      } catch (e) {
+        lastError = e;
+        if (streamed || (!isRetryable(e) && !(options.webSearch && attempt === 0))) throw e;
+        console.warn(`[Zamari] ${cloudModel} busy (attempt ${attempt + 1}); retrying.`, e);
+        if (attempt === 0) await sleep(600 + Math.random() * 900);
+      }
+    }
+  }
+  throw lastError;
+}
 
 async function nanoReady(): Promise<boolean> {
   return (await getNanoStatus()) === 'available';
@@ -297,8 +359,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
       intent === 'draft'
         ? helpDraftPrompt({ input, history, clarity: req.clarity, masked: vault.size > 0 })
         : helpQuickPrompt({ input, history, clarity: req.clarity, masked: vault.size > 0 });
-    const model = getHybridModel(InferenceMode.PREFER_ON_DEVICE, { cloudModel: CLOUD_MODEL_FAST, webSearch: true });
-    const res = await run(model, InferenceMode.PREFER_ON_DEVICE, prompt, stream);
+    const res = await runResilient(InferenceMode.PREFER_ON_DEVICE, CLOUD_MODEL_FAST, { webSearch: true }, prompt, stream);
     steps.push({
       label: intent === 'draft' ? 'Draft message' : 'Answer',
       engine: res.engine,
@@ -307,7 +368,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
     return {
       text: reveal(res.text),
       engine: res.engine,
-      model: modelLabel(res.engine, CLOUD_MODEL_FAST),
+      model: modelLabel(res.engine, res.model),
       steps,
       privacy: privacyInfo(vault),
       grounding: res.grounding,
@@ -345,8 +406,13 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
   const cloudPrompt: Prompt = parts.length ? [cloudText, ...parts] : cloudText;
   // Live questions only need a quick search-backed answer, so they use the faster model.
   const cloudModelName = intent === 'live' ? CLOUD_MODEL_FAST : CLOUD_MODEL_COMPLEX;
-  const cloudModel = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: cloudModelName, webSearch: true });
-  const answer = await run(cloudModel, InferenceMode.ONLY_IN_CLOUD, cloudPrompt, nanoClarity ? undefined : stream);
+  const answer = await runResilient(
+    InferenceMode.ONLY_IN_CLOUD,
+    cloudModelName,
+    { webSearch: true },
+    cloudPrompt,
+    nanoClarity ? undefined : stream,
+  );
   steps.push({
     label: req.brief
       ? 'Zafari Lab project brief'
@@ -356,7 +422,13 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
           ? 'Live answer'
           : 'Escalated answer',
     engine: answer.engine,
-    detail: answer.grounding ? `Searched the web · ${answer.grounding.sources.length} source(s)` : undefined,
+    detail:
+      [
+        answer.model !== cloudModelName && `${cloudModelName} busy — used ${answer.model}`,
+        answer.grounding && `Searched the web · ${answer.grounding.sources.length} source(s)`,
+      ]
+        .filter(Boolean)
+        .join(' · ') || undefined,
   });
 
   let finalText = answer.text;
@@ -375,7 +447,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
   return {
     text: reveal(finalText),
     engine: answer.engine,
-    model: cloudModelName,
+    model: answer.model,
     steps,
     privacy: privacyInfo(vault),
     grounding: answer.grounding,
@@ -406,7 +478,12 @@ export async function routeImage(req: HelpRequest): Promise<ZamariReply> {
     prompt;
 
   const model = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: CLOUD_MODEL_IMAGE, imageOutput: true });
-  const { response } = await model.generateContent(refs.length ? [instruction, ...refs] : instruction);
+  const request = refs.length ? [instruction, ...refs] : instruction;
+  const { response } = await model.generateContent(request).catch(async (e) => {
+    if (!isRetryable(e)) throw e;
+    await sleep(800 + Math.random() * 1200);
+    return model.generateContent(request);
+  });
   const images = (response.inlineDataParts() ?? [])
     .filter((p) => p.inlineData.mimeType.startsWith('image/'))
     .map((p) => ({ mimeType: p.inlineData.mimeType, data: p.inlineData.data }));
@@ -465,12 +542,15 @@ export async function routePlay(req: PlayRequest): Promise<ZamariReply> {
     mode = InferenceMode.ONLY_ON_DEVICE;
   }
 
-  const model = getHybridModel(mode, { cloudModel: CLOUD_MODEL_FAST, temperature: 0.9 });
-  const res = await run(model, mode, parts.length ? [text, ...parts] : text, req.onText);
+  const prompt = parts.length ? [text, ...parts] : text;
+  const res =
+    mode === InferenceMode.ONLY_ON_DEVICE
+      ? { ...(await run(getHybridModel(mode, { temperature: 0.9 }), mode, prompt, req.onText)), model: NANO_LABEL }
+      : await runResilient(mode, CLOUD_MODEL_FAST, { temperature: 0.9 }, prompt, req.onText);
   return {
     text: res.text,
     engine: res.engine,
-    model: modelLabel(res.engine, CLOUD_MODEL_FAST),
+    model: modelLabel(res.engine, res.model),
     steps: [{ label: 'Play', engine: res.engine }],
   };
 }
@@ -487,7 +567,7 @@ export function describeError(e: unknown): string {
     if (msg.includes('app check') || msg.includes('appcheck') || msg.includes('401')) {
       return 'I couldn’t verify this app just now. Please refresh and try again.';
     }
-    if (msg.includes('quota') || msg.includes('429')) return 'I’m a little overloaded right now 😅 Give me a moment and try again.';
+    if (isRetryable(e)) return 'Loads of people are chatting with me right now 😅 Give me a few seconds and try again!';
     if (msg.includes('not found') || msg.includes('404')) return 'That feature isn’t available right now. Please try something else!';
     if (msg.includes('safety') || msg.includes('blocked')) return 'I can’t help with that one — want to try something else?';
     return 'Oops, something glitched on my side. Mind trying that again?';

@@ -41,6 +41,8 @@ const firebaseConfig: FirebaseOptions = {
 
 export const CLOUD_MODEL_FAST: string = env.VITE_CLOUD_MODEL_FAST || 'gemini-3.5-flash-lite';
 export const CLOUD_MODEL_COMPLEX: string = env.VITE_CLOUD_MODEL_COMPLEX || 'gemini-3.6-flash';
+/** Optional extra Gemini model tried when both of the above are busy or rate-limited. */
+export const CLOUD_MODEL_BACKUP: string = env.VITE_CLOUD_MODEL_BACKUP || '';
 /** Image generation is cloud-only and needs the Firebase Blaze plan (no free-tier quota). */
 export const CLOUD_MODEL_IMAGE: string = env.VITE_CLOUD_MODEL_IMAGE || 'gemini-3.1-flash-image-preview';
 export const IMAGE_DAILY_LIMIT: number = Math.max(0, Number(env.VITE_IMAGE_DAILY_LIMIT ?? 3) || 0);
