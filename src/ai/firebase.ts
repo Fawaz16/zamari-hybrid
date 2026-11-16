@@ -43,7 +43,7 @@ export const CLOUD_MODEL_FAST: string = env.VITE_CLOUD_MODEL_FAST || 'gemini-3.5
 export const CLOUD_MODEL_COMPLEX: string = env.VITE_CLOUD_MODEL_COMPLEX || 'gemini-3.6-flash';
 /** Image generation is cloud-only and needs the Firebase Blaze plan (no free-tier quota). */
 export const CLOUD_MODEL_IMAGE: string = env.VITE_CLOUD_MODEL_IMAGE || 'gemini-3.1-flash-image-preview';
-export const IMAGE_DAILY_LIMIT: number = Math.max(0, Number(env.VITE_IMAGE_DAILY_LIMIT ?? 5) || 0);
+export const IMAGE_DAILY_LIMIT: number = Math.max(0, Number(env.VITE_IMAGE_DAILY_LIMIT ?? 3) || 0);
 
 /** True when the minimum Firebase config is present. The UI shows a setup banner otherwise. */
 export const isFirebaseConfigured = Boolean(
