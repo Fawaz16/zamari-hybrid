@@ -1,0 +1,12 @@
+{
+  "name": "Zamari",
+  "short_name": "Zamari",
+  "description": "Your fun, private, everyday AI companion.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07060d",
+  "theme_color": "#07060d",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
