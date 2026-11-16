@@ -56,6 +56,23 @@ export function transcript(history: ChatTurn[], maxTurns = 8, maxCharsPerTurn = 
     .join('\n');
 }
 
+/**
+ * Models have no clock: without this they answer "what's the date?" from their
+ * training data. Built fresh on every call from the user's own device clock.
+ */
+export function nowContext(now: Date = new Date()): string {
+  const date = now.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const time = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return (
+    `Current date and time for the user: ${date}, ${time} (${tz}). ` +
+    'Use this for anything involving today, dates, ages, days of the week or "how long until". ' +
+    'If you have a Google Search tool, use it for anything that may have changed since your training ' +
+    '(news, prices, scores, weather, releases, who currently holds a role, recent events) and answer from the results. ' +
+    'If you cannot search, say your information may be out of date instead of presenting it as current.'
+  );
+}
+
 function compose(parts: (string | false | undefined)[]): string {
   return parts.filter(Boolean).join('\n\n');
 }
@@ -68,12 +85,19 @@ function conversation(history: ChatTurn[], input: string): string {
 // --- Help Mode ---------------------------------------------------------------
 
 export function helpQuickPrompt(o: { input: string; history: ChatTurn[]; clarity: boolean; masked: boolean }) {
-  return compose([PERSONA, o.masked && PLACEHOLDER_RULES, o.clarity && CLARITY_RULES, conversation(o.history, o.input)]);
+  return compose([
+    PERSONA,
+    nowContext(),
+    o.masked && PLACEHOLDER_RULES,
+    o.clarity && CLARITY_RULES,
+    conversation(o.history, o.input),
+  ]);
 }
 
 export function helpDraftPrompt(o: { input: string; history: ChatTurn[]; clarity: boolean; masked: boolean }) {
   return compose([
     PERSONA,
+    nowContext(),
     'The user wants help writing a message. Write the draft ready to copy and send, ' +
       'matching the tone they asked for (friendly by default). After the draft, add one short line offering a tweak.',
     o.masked && PLACEHOLDER_RULES,
@@ -89,12 +113,18 @@ export function helpComplexPrompt(o: {
   clarity: boolean;
   brief: boolean;
   attachments?: boolean;
+  /** A question about current events: answer briefly from live search results. */
+  live?: boolean;
 }) {
   return compose([
     PERSONA,
+    nowContext(),
     PLACEHOLDER_RULES,
     o.attachments && ATTACHMENT_RULES,
-    o.brief
+    o.live
+      ? 'This question needs up-to-date information. Search the web first, then give a short, direct answer ' +
+        'with the key facts and when they are from. Do not pad it out.'
+      : o.brief
       ? `Turn the user's idea into a Zafari Lab project brief. Use markdown with these sections:
 ## Summary
 ## Goals
@@ -203,6 +233,7 @@ export function playPrompt(o: {
   return compose([
     'You are Zamari in Play Mode: playful, silly, encouraging and quick. Have fun with it! 🎉',
     IDENTITY_RULES,
+    nowContext(),
     o.attachments && ATTACHMENT_RULES,
     rules[o.game],
     o.clarity && CLARITY_RULES.replace('No long paragraphs and no tables.', 'Keep it very short and simple.'),

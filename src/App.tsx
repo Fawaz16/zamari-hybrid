@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
 import type { Attachment } from './ai/attachments';
 import { isFirebaseConfigured } from './ai/firebase';
-import { describeError, routeHelp, routePlay, type ChatTurn, type PlayGame, type ZamariReply } from './ai/hybridRouter';
+import {
+  describeError,
+  routeHelp,
+  routePlay,
+  type ChatTurn,
+  type Grounding,
+  type PlayGame,
+  type ZamariReply,
+} from './ai/hybridRouter';
 import { PLAY_GAMES, pickSecret } from './ai/prompts';
 import { Composer, type ComposerHandle } from './components/Composer';
 import {
@@ -534,10 +542,47 @@ function MessageItem({ msg }: { msg: Message }) {
             Thinking…
           </p>
         )}
+        {!msg.pending && msg.reply?.grounding && <LiveSources grounding={msg.reply.grounding} />}
         {!msg.pending && msg.text && <MessageActions text={msg.text} />}
         {DEBUG && msg.reply && <RouteDetails reply={msg.reply} />}
       </div>
     </article>
+  );
+}
+
+/**
+ * Sources for answers grounded with Google Search. Google's terms require showing the
+ * Search Suggestions widget exactly as returned; it's isolated in a sandboxed iframe so
+ * its HTML/CSS can't touch the app, and its links open in a new tab.
+ */
+function LiveSources({ grounding }: { grounding: Grounding }) {
+  return (
+    <div className="mt-3 space-y-2">
+      {grounding.sources.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="text-muted">🌐 Live sources:</span>
+          {grounding.sources.map((s) => (
+            <a
+              key={s.uri}
+              href={s.uri}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="max-w-[14rem] truncate rounded-full bg-surface-strong px-2.5 py-1 hover:bg-white/15 focus-visible:outline-2 focus-visible:outline-accent-violet"
+            >
+              {s.title}
+            </a>
+          ))}
+        </div>
+      )}
+      {grounding.searchSuggestionsHtml && (
+        <iframe
+          title="Related Google searches"
+          sandbox="allow-popups allow-popups-to-escape-sandbox"
+          srcDoc={`<base target="_blank"><style>body{margin:0;background:transparent}</style>${grounding.searchSuggestionsHtml}`}
+          className="h-16 w-full rounded-xl border-0"
+        />
+      )}
+    </div>
   );
 }
 

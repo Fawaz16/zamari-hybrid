@@ -111,6 +111,11 @@ export interface HybridModelOptions {
   onDeviceJsonSchema?: { name: string; schema: object };
   /** Ask the cloud model to return images as well as text. */
   imageOutput?: boolean;
+  /**
+   * Give the cloud model Google Search grounding so it can answer with live,
+   * up-to-date information. Ignored on-device (Nano has no tools).
+   */
+  webSearch?: boolean;
 }
 
 /**
@@ -121,12 +126,12 @@ export interface HybridModelOptions {
  */
 export function getHybridModel(
   mode: InferenceMode,
-  { cloudModel = CLOUD_MODEL_FAST, temperature, onDeviceJsonSchema, imageOutput }: HybridModelOptions = {},
+  { cloudModel = CLOUD_MODEL_FAST, temperature, onDeviceJsonSchema, imageOutput, webSearch }: HybridModelOptions = {},
 ): GenerativeModel {
   if (!firebase) {
     throw new Error('Firebase is not configured. Copy .env.example to .env.local and fill it in.');
   }
-  const key = `${mode}|${cloudModel}|${temperature ?? ''}|${onDeviceJsonSchema?.name ?? ''}|${imageOutput ? 'img' : ''}`;
+  const key = `${mode}|${cloudModel}|${temperature ?? ''}|${onDeviceJsonSchema?.name ?? ''}|${imageOutput ? 'img' : ''}|${webSearch ? 'search' : ''}`;
   let model = modelCache.get(key);
   if (!model) {
     model = getGenerativeModel(firebase.ai, {
@@ -137,6 +142,7 @@ export function getHybridModel(
           ...(temperature !== undefined && { temperature }),
           ...(imageOutput && { responseModalities: [ResponseModality.TEXT, ResponseModality.IMAGE] }),
         },
+        ...(webSearch && { tools: [{ googleSearch: {} }] }),
       },
       onDeviceParams: {
         createOptions: { expectedInputs: EN_TEXT, expectedOutputs: EN_TEXT },

@@ -6,7 +6,9 @@
  *   1. Local pattern scrub (emails, phones, cards, IDs, addresses) — always, instant.
  *   2. Classify the request locally (no model call): quick | draft | complex.
  *   3a. quick/draft   → PREFER_ON_DEVICE (fast; SDK falls back to cloud if Nano isn't ready).
- *   3b. complex/brief → Nano finds names & other free-form PII → ONLY_IN_CLOUD on the stronger model.
+ *   3b. complex/brief/live → Nano finds names & other free-form PII → ONLY_IN_CLOUD on the stronger model.
+ *       Cloud answers have Google Search grounding, so time-sensitive questions
+ *       ("latest", news, weather, prices, scores…) are classified 'live' and sent there.
  *   3c. attachments   → pictures/PDFs/voice notes need multimodal Cloud Gemini; documents are scrubbed first.
  *   4. Clarity Mode: Nano rewrites cloud answers; on-device answers get the rules in-prompt.
  *   5. Placeholders are swapped back to real values locally.
@@ -15,7 +17,14 @@
  *   PREFER_ON_DEVICE — Nano when available (zero latency, private, offline-capable);
  *   falls back to Cloud Gemini on devices without Nano (e.g. phones).
  */
-import { AIError, InferenceMode, InferenceSource, type GenerativeModel, type Part } from 'firebase/ai';
+import {
+  AIError,
+  InferenceMode,
+  InferenceSource,
+  type EnhancedGenerateContentResponse,
+  type GenerativeModel,
+  type Part,
+} from 'firebase/ai';
 import type { Attachment } from './attachments';
 import { CLOUD_MODEL_COMPLEX, CLOUD_MODEL_FAST, CLOUD_MODEL_IMAGE, getHybridModel, getNanoStatus } from './firebase';
 import { imageLimit, imagesLeftToday, recordImageCreated } from './imageQuota';
@@ -35,7 +44,14 @@ import {
 
 export type { ChatTurn, PlayGame };
 export type Engine = 'nano' | 'cloud';
-export type HelpIntent = 'quick' | 'draft' | 'complex';
+export type HelpIntent = 'quick' | 'draft' | 'complex' | 'live';
+
+/** Live web results the answer was based on (Google Search grounding). */
+export interface Grounding {
+  sources: { title: string; uri: string }[];
+  /** Google's Search Suggestions widget (HTML/CSS). Must be shown with grounded answers. */
+  searchSuggestionsHtml?: string;
+}
 
 export interface RouteStep {
   label: string;
@@ -53,6 +69,8 @@ export interface ZamariReply {
   privacy?: { masked: Partial<Record<PiiKind, number>>; total: number };
   /** Generated images (base64). */
   images?: { mimeType: string; data: string }[];
+  /** Present when the answer used live Google Search results. */
+  grounding?: Grounding;
 }
 
 export class RouteError extends Error {
@@ -75,6 +93,21 @@ type Prompt = string | (string | Part)[];
 interface RunResult {
   text: string;
   engine: Engine;
+  grounding?: Grounding;
+}
+
+function groundingOf(response: EnhancedGenerateContentResponse): Grounding | undefined {
+  const meta = response.candidates?.[0]?.groundingMetadata;
+  if (!meta) return undefined;
+  const seen = new Set<string>();
+  const sources = (meta.groundingChunks ?? [])
+    .map((c) => c.web)
+    .filter((w): w is { uri: string; title?: string } => !!w?.uri)
+    .filter((w) => !seen.has(w.uri) && !!seen.add(w.uri))
+    .slice(0, 6)
+    .map((w) => ({ uri: w.uri, title: w.title || new URL(w.uri).hostname }));
+  const searchSuggestionsHtml = meta.searchEntryPoint?.renderedContent;
+  return sources.length || searchSuggestionsHtml ? { sources, searchSuggestionsHtml } : undefined;
 }
 
 /**
@@ -94,7 +127,7 @@ async function run(
 
   if (!onText) {
     const { response } = await model.generateContent(prompt);
-    return { text: response.text(), engine: engineOf(response.inferenceSource) };
+    return { text: response.text(), engine: engineOf(response.inferenceSource), grounding: groundingOf(response) };
   }
 
   const { stream, response } = await model.generateContentStream(prompt);
@@ -104,7 +137,7 @@ async function run(
     onText(text);
   }
   const final = await response;
-  return { text, engine: engineOf(final.inferenceSource) };
+  return { text, engine: engineOf(final.inferenceSource), grounding: groundingOf(final) };
 }
 
 const modelLabel = (engine: Engine, cloudModel: string) => (engine === 'nano' ? NANO_LABEL : cloudModel);
@@ -122,6 +155,17 @@ const COMPLEX_HINTS =
 const DRAFT_HINTS =
   /\b(draft|write|reply|respond|rephrase|reword|email|message|text (?:to|for)|letter|note to|cover letter|caption|apologi[sz]e)\b/i;
 
+/** Questions whose answer changes over time — these need live web search in the cloud. */
+const LIVE_HINTS =
+  /\b(news|headlines?|latest|newest|recent(?:ly)?|currently|current(?:ly)? (?:price|president|prime minister|ceo|champion|leader|status|rate)|right now|tonight|yesterday|this (?:week|weekend|month|season)|weather|forecast|temperature (?:in|outside)|price of|how much (?:is|are|does)|stock|share price|exchange rate|bitcoin|crypto|score|fixtures?|who won|winner|(?:election|match|game|race|exam|lottery) results?|standings|election|released?|release date|coming out|trending|open now|traffic|flights?|update[sd]?)\b|\b20[2-9]\d\b/i;
+/** Date/time questions are answered locally from the device clock — no search needed. */
+const CLOCK_ONLY = /^\s*(?:what(?:'s| is)?|which)\s+(?:the\s+)?(?:date|day|time|year|month)\b[^?]*\??\s*$/i;
+
+/** True when the user needs current, real-world information. */
+export function needsLiveInfo(input: string): boolean {
+  return !CLOCK_ONLY.test(input) && LIVE_HINTS.test(input);
+}
+
 const IMAGE_HINTS =
   /^\s*(?:please\s+)?(?:draw|paint|sketch|illustrate|imagine)\b|\b(?:create|generate|make|draw|design|render|paint|give me|show me)\b.{0,40}\b(?:image|picture|pic|photo|drawing|illustration|logo|poster|artwork|art|painting|wallpaper|sticker|icon|avatar|cartoon|meme)\b/i;
 
@@ -133,6 +177,7 @@ export function isImageRequest(input: string): boolean {
 export function classifyHelpRequest(input: string): HelpIntent {
   if (input.length > 700 || /```/.test(input) || COMPLEX_HINTS.test(input)) return 'complex';
   if (DRAFT_HINTS.test(input)) return 'draft';
+  if (needsLiveInfo(input)) return 'live';
   return 'quick';
 }
 
@@ -233,6 +278,7 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
     steps.push({ label: 'Offline — kept on-device', engine: 'local' });
     const masked = vault.size > 0;
     const fullInput = withAttachmentText(input, attachments, vault);
+    // 'live' questions can't be searched offline; Nano answers and the prompt makes it flag possible staleness.
     const prompt =
       intent === 'complex'
         ? helpComplexPrompt({ input: fullInput, history, clarity: req.clarity, brief: !!req.brief, attachments: hasAttachments })
@@ -245,13 +291,13 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
     return { text: reveal(res.text), engine: res.engine, model: NANO_LABEL, steps, privacy: privacyInfo(vault) };
   }
 
-  // 3a. Quick / draft → prefer on-device.
-  if (intent !== 'complex') {
+  // 3a. Quick / draft → prefer on-device. (If Nano isn't ready, the cloud fallback can still search.)
+  if (intent === 'quick' || intent === 'draft') {
     const prompt =
       intent === 'draft'
         ? helpDraftPrompt({ input, history, clarity: req.clarity, masked: vault.size > 0 })
         : helpQuickPrompt({ input, history, clarity: req.clarity, masked: vault.size > 0 });
-    const model = getHybridModel(InferenceMode.PREFER_ON_DEVICE, { cloudModel: CLOUD_MODEL_FAST });
+    const model = getHybridModel(InferenceMode.PREFER_ON_DEVICE, { cloudModel: CLOUD_MODEL_FAST, webSearch: true });
     const res = await run(model, InferenceMode.PREFER_ON_DEVICE, prompt, stream);
     steps.push({
       label: intent === 'draft' ? 'Draft message' : 'Answer',
@@ -264,10 +310,11 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
       model: modelLabel(res.engine, CLOUD_MODEL_FAST),
       steps,
       privacy: privacyInfo(vault),
+      grounding: res.grounding,
     };
   }
 
-  // 3b/3c. Complex or attachments → deep scrub on Nano, then escalate to Cloud Gemini.
+  // 3b/3c/3d. Complex, attachments or live info → deep scrub on Nano, then escalate to Cloud Gemini.
   if (hasNano) {
     try {
       const context = `${transcript(history, 4)}\nUser: ${input}`.slice(-3000);
@@ -292,14 +339,24 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
     clarity: req.clarity && !nanoClarity,
     brief: !!req.brief,
     attachments: hasAttachments,
+    live: intent === 'live',
   });
   const parts = inlineParts(attachments);
   const cloudPrompt: Prompt = parts.length ? [cloudText, ...parts] : cloudText;
-  const cloudModel = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: CLOUD_MODEL_COMPLEX });
+  // Live questions only need a quick search-backed answer, so they use the faster model.
+  const cloudModelName = intent === 'live' ? CLOUD_MODEL_FAST : CLOUD_MODEL_COMPLEX;
+  const cloudModel = getHybridModel(InferenceMode.ONLY_IN_CLOUD, { cloudModel: cloudModelName, webSearch: true });
   const answer = await run(cloudModel, InferenceMode.ONLY_IN_CLOUD, cloudPrompt, nanoClarity ? undefined : stream);
   steps.push({
-    label: req.brief ? 'Zafari Lab project brief' : hasAttachments ? 'Answer with attachments' : 'Escalated answer',
+    label: req.brief
+      ? 'Zafari Lab project brief'
+      : hasAttachments
+        ? 'Answer with attachments'
+        : intent === 'live'
+          ? 'Live answer'
+          : 'Escalated answer',
     engine: answer.engine,
+    detail: answer.grounding ? `Searched the web · ${answer.grounding.sources.length} source(s)` : undefined,
   });
 
   let finalText = answer.text;
@@ -318,9 +375,10 @@ export async function routeHelp(req: HelpRequest): Promise<ZamariReply> {
   return {
     text: reveal(finalText),
     engine: answer.engine,
-    model: CLOUD_MODEL_COMPLEX,
+    model: cloudModelName,
     steps,
     privacy: privacyInfo(vault),
+    grounding: answer.grounding,
   };
 }
 
