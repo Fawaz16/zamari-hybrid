@@ -55,7 +55,7 @@ Gemini Nano runs only in desktop Chrome with built-in AI turned on. In other bro
 
 ## Team
 
-- Fawaz Rufai ([@fawazrufai](https://github.com/fawazrufai))
+- Fawaz Rufai ([@Fawaz16](https://github.com/Fawaz16))
 
 ## License
 
