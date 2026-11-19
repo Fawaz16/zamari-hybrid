@@ -38,7 +38,7 @@ npm run dev
 ## Try it
 
 - **Hackathon edition** (this branch, `main`: Firebase AI Logic + Gemini only): https://zamari-hackathon.vercel.app
-- **Zafari Lab edition** (branch [`zafari`](../../tree/zafari): Claude + sign-in and plans): https://zamari.zafarilab.com
+- **Zafari Lab edition** (hosted product, closed source: Claude + sign-in and plans): https://zamari.zafarilab.com
 - **Demo video:** _link coming soon_
 
 Gemini Nano runs only in desktop Chrome with built-in AI turned on. In other browsers, Zamari falls back to the cloud automatically, and the badge on each answer shows where it ran.
