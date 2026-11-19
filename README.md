@@ -34,3 +34,29 @@ npm run dev
 - `src/ai/privacy.ts`: reversible PII masking (`PrivacyVault`).
 - `src/ai/prompts.ts`: self-contained prompts. Nano ignores `systemInstruction` and has no memory between calls.
 - `src/App.tsx`: accessible UI with a mode switcher, Clarity toggle and routing badges.
+
+## Try it
+
+- **Hackathon edition** (this branch, `main`: Firebase AI Logic + Gemini only): https://zamari-hackathon.vercel.app
+- **Zafari Lab edition** (branch [`zafari`](../../tree/zafari): Claude + sign-in and plans): https://zamari.zafarilab.com
+- **Demo video:** _link coming soon_
+
+Gemini Nano runs only in desktop Chrome with built-in AI turned on. In other browsers, Zamari falls back to the cloud automatically, and the badge on each answer shows where it ran.
+
+## AI tools disclosure
+
+**AI inside the product**
+- **Gemini Nano** (on-device, through Chrome's Prompt API via Firebase AI Logic hybrid inference): Play Mode, the Privacy Scrubber, Clarity rewrites and quick answers.
+- **Cloud Gemini** (`gemini-3.5-flash-lite`, `gemini-3.6-flash` through Firebase AI Logic): complex requests and fallback when Nano isn't available.
+- **Zafari Lab edition only:** **Claude Haiku 5.5** and **Claude Sonnet 5.5** (Anthropic API) for cloud chat and reasoning. **Gemini Flash** and **Gemini Flash Image** handle long PDFs, voice-note transcription and image creation.
+
+**AI used to build it**
+- **Claude Code** (Anthropic) helped write code, debug, review and write documentation. Commits it helped with carry a `Co-Authored-By: Claude` line. The product idea, design decisions, testing and direction are the team's own.
+
+## Team
+
+- Fawaz Rufai ([@fawazrufai](https://github.com/fawazrufai))
+
+## License
+
+[MIT](LICENSE)
